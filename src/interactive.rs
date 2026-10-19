@@ -6,7 +6,7 @@ use dialoguer::{Confirm, FuzzySelect, Input, Select, theme::ColorfulTheme};
 use crate::{
     api::MenderApi,
     favorite::{FavoriteDevice, Favorites},
-    models::{InventoryDevice, SortKey, sort_artifacts},
+    models::{Artifact, InventoryDevice, SortKey, sort_artifacts},
     picker, portforward, terminal, ui,
 };
 
@@ -15,13 +15,14 @@ pub async fn run(api: &MenderApi, server: &str, token: &str, skip_verify: bool) 
     let theme = ColorfulTheme::default();
     let mut favorites = Favorites::load()?;
     let mut initial_selection = 0;
+    let mut checked_devices = Vec::new();
+    let devices = api.search_devices().await?;
+    if devices.is_empty() {
+        ui::warning("No accepted devices were found.");
+        return Ok(());
+    }
     loop {
-        let devices = api.search_devices().await?;
-        if devices.is_empty() {
-            ui::warning("No accepted devices were found.");
-            return Ok(());
-        }
-        let choice = loop {
+        let pick = loop {
             let favorite_id = favorites
                 .for_server(server)
                 .map(|favorite| favorite.id.as_str());
@@ -37,6 +38,7 @@ pub async fn run(api: &MenderApi, server: &str, token: &str, skip_verify: bool) 
                     ]
                 })
                 .collect::<Vec<_>>();
+            let checked = checked_devices.clone();
             let pick = tokio::task::spawn_blocking(move || {
                 picker::pick_device(
                     "Select a device",
@@ -44,14 +46,21 @@ pub async fn run(api: &MenderApi, server: &str, token: &str, skip_verify: bool) 
                     rows,
                     favorite_index,
                     initial_selection,
+                    checked,
                 )
             })
             .await??;
             match pick {
-                picker::DevicePick::Selected(index) => break Some(index),
-                picker::DevicePick::Cancelled => break None,
-                picker::DevicePick::ToggleFavorite(index) => {
+                picker::DevicePick::Selected(index) => {
+                    break picker::DevicePick::Selected(index);
+                }
+                picker::DevicePick::SelectedMany(indices) => {
+                    break picker::DevicePick::SelectedMany(indices);
+                }
+                picker::DevicePick::Cancelled => break picker::DevicePick::Cancelled,
+                picker::DevicePick::ToggleFavorite { index, checked } => {
                     initial_selection = index;
+                    checked_devices = checked;
                     let device = &devices[index];
                     let name = device.display_name();
                     let is_favorite = favorites
@@ -73,13 +82,28 @@ pub async fn run(api: &MenderApi, server: &str, token: &str, skip_verify: bool) 
                 }
             }
         };
-        let Some(choice) = choice else {
-            break;
-        };
-        initial_selection = choice;
-        let device = &devices[choice];
-        if !device_menu(api, server, token, skip_verify, device, &theme).await? {
-            break;
+        match pick {
+            picker::DevicePick::Selected(choice) => {
+                checked_devices.clear();
+                initial_selection = choice;
+                let device = &devices[choice];
+                if !device_menu(api, server, token, skip_verify, device, &theme).await? {
+                    break;
+                }
+            }
+            picker::DevicePick::SelectedMany(indices) => {
+                initial_selection = indices[0];
+                checked_devices.clear();
+                let selected = indices
+                    .into_iter()
+                    .map(|index| devices[index].clone())
+                    .collect::<Vec<_>>();
+                if let Err(error) = deploy_artifact_to_many(api, &selected, &theme).await {
+                    ui::error(format!("{error:#}"));
+                }
+            }
+            picker::DevicePick::Cancelled => break,
+            picker::DevicePick::ToggleFavorite { .. } => unreachable!(),
         }
     }
     ui::success("Goodbye.");
@@ -99,7 +123,7 @@ async fn device_menu(
         "TCP port forwarding",
         "Upload a file",
         "Download a file",
-        "Deploy an artifact",
+        "Deploy an artifact to this device",
         "Show inventory",
         "Choose another device",
         "Quit",
@@ -216,45 +240,9 @@ async fn deploy_artifact(
     device: &InventoryDevice,
     theme: &ColorfulTheme,
 ) -> Result<()> {
-    let artifacts = api.list_artifacts(1, 500).await?;
-    if artifacts.is_empty() {
-        ui::warning("No artifacts are available.");
-        return Ok(());
-    }
-    let ordering = Select::with_theme(theme)
-        .with_prompt(format!("Order artifacts for {}", device.display_name()))
-        .items(["Name", "Type"])
-        .default(0)
-        .interact()?;
-    let mut artifacts = artifacts;
-    sort_artifacts(
-        &mut artifacts,
-        if ordering == 0 {
-            SortKey::Name
-        } else {
-            SortKey::Type
-        },
-    );
-    let rows = artifacts
-        .iter()
-        .map(|artifact| {
-            let kind = artifact.kind();
-            let kind = if kind == "unknown" {
-                "—".to_owned()
-            } else {
-                kind
-            };
-            vec![artifact.name.clone(), kind, artifact.description.clone()]
-        })
-        .collect::<Vec<_>>();
-    let Some(choice) = tokio::task::spawn_blocking(move || {
-        picker::pick("Select an artifact", &["Name", "Type", "Description"], rows)
-    })
-    .await??
-    else {
+    let Some(artifact) = select_artifact(api, theme, &device.display_name()).await? else {
         return Ok(());
     };
-    let artifact = &artifacts[choice];
     if Confirm::with_theme(theme)
         .with_prompt(format!(
             "Deploy {} to {}?",
@@ -268,4 +256,79 @@ async fn deploy_artifact(
         ui::success(format!("Deployment of {} created.", artifact.name));
     }
     Ok(())
+}
+
+async fn deploy_artifact_to_many(
+    api: &MenderApi,
+    devices: &[InventoryDevice],
+    theme: &ColorfulTheme,
+) -> Result<()> {
+    let Some(artifact) = select_artifact(api, theme, "selected devices").await? else {
+        return Ok(());
+    };
+    let device_ids = devices
+        .iter()
+        .map(|device| device.id.as_str())
+        .collect::<Vec<_>>();
+    if Confirm::with_theme(theme)
+        .with_prompt(format!(
+            "Deploy {} to {} selected devices?",
+            artifact.name,
+            device_ids.len()
+        ))
+        .default(false)
+        .interact()?
+    {
+        api.deploy_many(&device_ids, &artifact.name, None).await?;
+        ui::success(format!(
+            "Deployment of {} to {} devices created.",
+            artifact.name,
+            device_ids.len()
+        ));
+    }
+    Ok(())
+}
+
+async fn select_artifact(
+    api: &MenderApi,
+    theme: &ColorfulTheme,
+    target: &str,
+) -> Result<Option<Artifact>> {
+    let mut artifacts = api.list_all_artifacts().await?;
+    if artifacts.is_empty() {
+        ui::warning("No artifacts are available.");
+        return Ok(None);
+    }
+    let ordering = Select::with_theme(theme)
+        .with_prompt(format!("Order artifacts for {target}"))
+        .items(["Name", "Type"])
+        .default(0)
+        .interact()?;
+    let sort = if ordering == 0 {
+        SortKey::Name
+    } else {
+        SortKey::Type
+    };
+    sort_artifacts(&mut artifacts, sort);
+    let rows = artifact_rows(&artifacts);
+    let choice = tokio::task::spawn_blocking(move || {
+        picker::pick("Select an artifact", &["Name", "Type", "Description"], rows)
+    })
+    .await??;
+    Ok(choice.map(|index| artifacts[index].clone()))
+}
+
+fn artifact_rows(artifacts: &[Artifact]) -> Vec<Vec<String>> {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            let kind = artifact.kind();
+            let kind = if kind == "unknown" {
+                "—".to_owned()
+            } else {
+                kind
+            };
+            vec![artifact.name.clone(), kind, artifact.description.clone()]
+        })
+        .collect()
 }

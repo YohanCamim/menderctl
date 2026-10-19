@@ -1,6 +1,7 @@
 use std::{
     io::{self, IsTerminal},
     path::PathBuf,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -11,7 +12,10 @@ use tracing_subscriber::EnvFilter;
 
 use menderctl::{
     api::MenderApi,
-    cli::{ArtifactsCommand, Cli, Command, CompletionShell, DevicesCommand, LoginArgs},
+    cli::{
+        ArtifactsCommand, Cli, Command, CompletionShell, DeploymentsCommand, DevicesCommand,
+        LoginArgs,
+    },
     config::{RuntimeConfig, save_token},
     favorite::Favorites,
     interactive,
@@ -106,6 +110,7 @@ async fn dispatch_authenticated(
             }
         },
         Command::Artifacts { command } => artifacts(api, command).await,
+        Command::Deployments { command } => deployments(api, command).await,
         Command::Terminal { device_id } => {
             terminal::run(api, &config.server, token, config.skip_verify, &device_id).await
         }
@@ -204,19 +209,108 @@ async fn artifacts(api: &MenderApi, command: ArtifactsCommand) -> Result<()> {
         }
         ArtifactsCommand::Deploy {
             artifact_name,
-            device_id,
+            device_ids,
             name,
             yes,
         } => {
-            let device_name = api.display_name(&device_id).await;
-            if yes
-                || confirm(&format!(
-                    "Deploy {artifact_name} to {device_name} ({device_id})?"
-                ))?
-            {
-                api.deploy(&device_id, &artifact_name, name.as_deref())
+            let target = match device_ids.as_slice() {
+                [device_id] => {
+                    let device_name = api.display_name(device_id).await;
+                    format!("{device_name} ({device_id})")
+                }
+                devices => format!("{} devices", devices.len()),
+            };
+            if yes || confirm(&format!("Deploy {artifact_name} to {target}?"))? {
+                let device_ids = device_ids.iter().map(String::as_str).collect::<Vec<_>>();
+                api.deploy_many(&device_ids, &artifact_name, name.as_deref())
                     .await?;
                 ui::success("Deployment created.");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn deployments(api: &MenderApi, command: DeploymentsCommand) -> Result<()> {
+    match command {
+        DeploymentsCommand::List(args) => {
+            let page = api
+                .list_deployments(
+                    args.list.page,
+                    args.list.per_page,
+                    args.status.map(|status| status.as_str()),
+                    args.search.as_deref(),
+                )
+                .await?;
+            if args.list.raw {
+                println!("{}", serde_json::to_string_pretty(&page.items)?);
+            } else {
+                ui::deployments_table(&page.items);
+                if let Some(total) = page.total {
+                    println!(
+                        "{}",
+                        console::Style::new().dim().apply_to(format!(
+                            "Page {} · {} shown · {total} total",
+                            args.list.page,
+                            page.items.len()
+                        ))
+                    );
+                }
+            }
+        }
+        DeploymentsCommand::Show { deployment_id, raw } => {
+            let (deployment, statistics) = tokio::try_join!(
+                api.deployment(&deployment_id),
+                api.deployment_statistics(&deployment_id)
+            )?;
+            if raw {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "deployment": deployment,
+                        "statistics": statistics,
+                    }))?
+                );
+            } else {
+                ui::deployment_details(&deployment, &statistics);
+            }
+        }
+        DeploymentsCommand::Watch {
+            deployment_id,
+            interval,
+        } => loop {
+            let (deployment, statistics) = tokio::try_join!(
+                api.deployment(&deployment_id),
+                api.deployment_statistics(&deployment_id)
+            )?;
+            ui::deployment_dashboard(&deployment, &statistics)?;
+            if deployment.is_finished() {
+                ui::success("Deployment finished.");
+                break;
+            }
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!();
+                    ui::warning("Deployment watch stopped; the deployment is still running.");
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+            }
+        },
+        DeploymentsCommand::Cancel { deployment_id, yes } => {
+            let deployment = api.deployment(&deployment_id).await?;
+            if deployment.is_finished() {
+                ui::warning("This deployment is already finished and cannot be cancelled.");
+                return Ok(());
+            }
+            if yes
+                || confirm(&format!(
+                    "Cancel deployment {} ({deployment_id})?",
+                    deployment.name
+                ))?
+            {
+                api.cancel_deployment(&deployment_id).await?;
+                ui::success("Deployment cancellation requested.");
             }
         }
     }

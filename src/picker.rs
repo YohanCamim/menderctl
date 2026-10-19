@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{collections::BTreeSet, io::Write};
 
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -20,36 +20,49 @@ use crossterm::{
 
 const HELP: &str = "↑/↓ move · PgUp/PgDn page · type to filter · Enter select · Esc cancel";
 const DEVICE_HELP: &str =
-    "↑/↓ move · PgUp/PgDn page · type to filter · Enter select · Shift+F favorite · Esc cancel";
+    "↑/↓ move · type to filter · Space mark · Enter open/deploy · Shift+F favorite · Esc cancel";
 const VIEW_HELP: &str = "↑/↓ move · PgUp/PgDn page · type filter · Shift+C copy · Esc close";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DevicePick {
     Selected(usize),
-    ToggleFavorite(usize),
+    SelectedMany(Vec<usize>),
+    ToggleFavorite { index: usize, checked: Vec<usize> },
     Cancelled,
 }
 
 /// Interactive, filterable selector that renders the candidates as a table.
 /// Returns the index of the picked row, or `None` when the user cancels.
 pub fn pick(title: &str, headers: &[&str], rows: Vec<Vec<String>>) -> Result<Option<usize>> {
-    match pick_inner(title, headers, rows, None, 0, false)? {
+    match pick_inner(title, headers, rows, None, 0, false, Vec::new())? {
         DevicePick::Selected(index) => Ok(Some(index)),
         DevicePick::Cancelled => Ok(None),
-        DevicePick::ToggleFavorite(_) => unreachable!("favorites are disabled for this picker"),
+        DevicePick::SelectedMany(_) | DevicePick::ToggleFavorite { .. } => {
+            unreachable!("multi-selection and favorites are disabled for this picker")
+        }
     }
 }
 
-/// Device selector with a persistent favorite marker and a `Shift+F` action.
-/// `favorite` and `initial_selection` are row indices in the unfiltered list.
+/// Device selector with favorites and deployment target selection. Space marks
+/// rows; Enter opens one unmarked row or confirms all marked rows.
+/// `favorite`, `initial_selection`, and `checked` use unfiltered row indices.
 pub fn pick_device(
     title: &str,
     headers: &[&str],
     rows: Vec<Vec<String>>,
     favorite: Option<usize>,
     initial_selection: usize,
+    checked: Vec<usize>,
 ) -> Result<DevicePick> {
-    pick_inner(title, headers, rows, favorite, initial_selection, true)
+    pick_inner(
+        title,
+        headers,
+        rows,
+        favorite,
+        initial_selection,
+        true,
+        checked,
+    )
 }
 
 /// Read-only table browser. The selected row can copy one of its columns to
@@ -61,7 +74,7 @@ pub fn view(
     copy_column: usize,
 ) -> Result<()> {
     let _guard = TtyGuard::enable()?;
-    let mut picker = Picker::new(title, headers, rows, None, 0, false);
+    let mut picker = Picker::new(title, headers, rows, None, 0, false, false);
     let mut stdout = std::io::stdout();
     let mut notice = None;
 
@@ -169,6 +182,7 @@ fn pick_inner(
     favorite: Option<usize>,
     initial_selection: usize,
     allow_favorite: bool,
+    initial_checked: Vec<usize>,
 ) -> Result<DevicePick> {
     let _guard = TtyGuard::enable()?;
     let mut picker = Picker::new(
@@ -178,6 +192,12 @@ fn pick_inner(
         favorite,
         initial_selection,
         allow_favorite,
+        allow_favorite,
+    );
+    picker.checked.extend(
+        initial_checked
+            .into_iter()
+            .filter(|&index| index < picker.rows.len()),
     );
     let mut stdout = std::io::stdout();
 
@@ -211,6 +231,11 @@ fn pick_inner(
 
         match read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Enter if picker.multi_select && !picker.checked.is_empty() => {
+                    return Ok(DevicePick::SelectedMany(
+                        picker.checked.iter().copied().collect(),
+                    ));
+                }
                 KeyCode::Enter => {
                     if let Some(&index) = matching.get(picker.selected) {
                         return Ok(DevicePick::Selected(index));
@@ -219,6 +244,13 @@ fn pick_inner(
                 KeyCode::Esc => return Ok(DevicePick::Cancelled),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(DevicePick::Cancelled);
+                }
+                KeyCode::Char(' ') if picker.multi_select => {
+                    if let Some(&index) = matching.get(picker.selected)
+                        && !picker.checked.insert(index)
+                    {
+                        picker.checked.remove(&index);
+                    }
                 }
                 KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
                 KeyCode::Down => {
@@ -251,7 +283,10 @@ fn pick_inner(
                         && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
                 {
                     if let Some(&index) = matching.get(picker.selected) {
-                        return Ok(DevicePick::ToggleFavorite(index));
+                        return Ok(DevicePick::ToggleFavorite {
+                            index,
+                            checked: picker.checked.iter().copied().collect(),
+                        });
                     }
                 }
                 KeyCode::Char(input)
@@ -276,6 +311,8 @@ struct Picker {
     offset: usize,
     favorite: Option<usize>,
     allow_favorite: bool,
+    multi_select: bool,
+    checked: BTreeSet<usize>,
 }
 
 struct Frame<'a> {
@@ -296,6 +333,7 @@ impl Picker {
         favorite: Option<usize>,
         initial_selection: usize,
         allow_favorite: bool,
+        multi_select: bool,
     ) -> Self {
         let selected = initial_selection.min(rows.len().saturating_sub(1));
         Self {
@@ -307,6 +345,8 @@ impl Picker {
             offset: 0,
             favorite,
             allow_favorite,
+            multi_select,
+            checked: BTreeSet::new(),
         }
     }
 
@@ -351,7 +391,12 @@ impl Picker {
         } else {
             format!("{}/{}", self.selected + 1, matching.len())
         };
-        let status = format!("{position} · {} total", self.rows.len());
+        let selected = if self.multi_select {
+            format!(" · {} selected", self.checked.len())
+        } else {
+            String::new()
+        };
+        let status = format!("{position} · {} total{selected}", self.rows.len());
         let filter_line = spread(
             &format!("Filter: {}", self.filter),
             &status,
@@ -386,13 +431,14 @@ impl Picker {
                 .map(|(column, cell)| {
                     let is_favorite = self.favorite == Some(index);
                     let mut cell = Cell::new(if column == 0 {
-                        let cursor = if is_selected { "❯" } else { " " };
-                        if self.allow_favorite {
-                            let star = if is_favorite { "★" } else { " " };
-                            format!("{cursor} {star} {cell}")
-                        } else {
-                            format!("{cursor} {cell}")
-                        }
+                        decorate_first_cell(
+                            cell,
+                            is_selected,
+                            self.checked.contains(&index),
+                            is_favorite,
+                            self.multi_select,
+                            self.allow_favorite,
+                        )
                     } else {
                         cell.clone()
                     });
@@ -443,6 +489,31 @@ impl Picker {
         }
         stdout.flush()?;
         Ok(())
+    }
+}
+
+fn decorate_first_cell(
+    value: &str,
+    is_selected: bool,
+    is_checked: bool,
+    is_favorite: bool,
+    multi_select: bool,
+    allow_favorite: bool,
+) -> String {
+    let cursor = if is_selected { ">" } else { " " };
+    if multi_select {
+        let mark = if is_checked { "[x]" } else { "[ ]" };
+        if allow_favorite {
+            let star = if is_favorite { "*" } else { " " };
+            format!("{mark} {cursor} {star} {value}")
+        } else {
+            format!("{mark} {cursor} {value}")
+        }
+    } else if allow_favorite {
+        let star = if is_favorite { "*" } else { " " };
+        format!("[{cursor}] {star} {value}")
+    } else {
+        value.to_owned()
     }
 }
 
@@ -597,5 +668,30 @@ mod tests {
         let mut output = Vec::new();
         copy_to_clipboard(&mut output, "hello world").unwrap();
         assert_eq!(output, b"\x1b]52;c;aGVsbG8gd29ybGQ=\x07");
+    }
+
+    #[test]
+    fn row_prefix_never_starts_with_trimmable_whitespace() {
+        for selected in [false, true] {
+            for checked in [false, true] {
+                for favorite in [false, true] {
+                    let value = decorate_first_cell(
+                        "device-with-a-long-name",
+                        selected,
+                        checked,
+                        favorite,
+                        true,
+                        true,
+                    );
+                    assert!(value.starts_with('['));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn regular_tables_do_not_add_selection_markers() {
+        let value = decorate_first_cell("artifact-name", true, false, false, false, false);
+        assert_eq!(value, "artifact-name");
     }
 }

@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 
 use anyhow::Result;
 use comfy_table::{
@@ -9,7 +9,7 @@ use console::{Emoji, Style};
 use serde_json::Value;
 
 use crate::{
-    models::{Artifact, Device, InventoryDevice},
+    models::{Artifact, Deployment, DeploymentStatistics, Device, InventoryDevice},
     picker,
 };
 
@@ -134,6 +134,114 @@ pub fn artifacts_table(artifacts: &[Artifact]) {
     println!("\n{table}");
 }
 
+pub fn deployments_table(deployments: &[Deployment]) {
+    let mut table = styled_table();
+    table.set_header(header(&[
+        "Name",
+        "Artifact",
+        "Status",
+        "Devices",
+        "Created",
+        "Deployment ID",
+    ]));
+    for deployment in deployments {
+        table.add_row(vec![
+            Cell::new(&deployment.name).fg(Color::Cyan),
+            Cell::new(&deployment.artifact_name),
+            deployment_status_cell(&deployment.status),
+            Cell::new(deployment.device_count).fg(Color::Magenta),
+            Cell::new(&deployment.created).fg(Color::DarkGrey),
+            Cell::new(&deployment.id),
+        ]);
+    }
+    println!("\n{table}");
+}
+
+pub fn deployment_details(deployment: &Deployment, statistics: &DeploymentStatistics) {
+    println!("{}", deployment_report(deployment, statistics));
+}
+
+pub fn deployment_dashboard(
+    deployment: &Deployment,
+    statistics: &DeploymentStatistics,
+) -> Result<()> {
+    let mut stdout = io::stdout();
+    if stdout.is_terminal() {
+        write!(stdout, "\x1b[2J\x1b[H")?;
+    }
+    write!(stdout, "{}", deployment_report(deployment, statistics))?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn deployment_report(deployment: &Deployment, statistics: &DeploymentStatistics) -> String {
+    let mut details = styled_table();
+    details.set_header(header(&["Deployment", "Value"]));
+    details.add_row(vec![Cell::new("Name"), Cell::new(&deployment.name)]);
+    details.add_row(vec![Cell::new("ID"), Cell::new(&deployment.id)]);
+    details.add_row(vec![
+        Cell::new("Artifact"),
+        Cell::new(&deployment.artifact_name).fg(Color::Cyan),
+    ]);
+    details.add_row(vec![
+        Cell::new("Status"),
+        deployment_status_cell(&deployment.status),
+    ]);
+    details.add_row(vec![Cell::new("Created"), Cell::new(&deployment.created)]);
+    details.add_row(vec![
+        Cell::new("Finished"),
+        Cell::new(deployment.finished.as_deref().unwrap_or("—")),
+    ]);
+
+    let mut states = styled_table();
+    states.set_header(header(&["Device state", "Count"]));
+    for (label, count, color) in [
+        ("Success", statistics.success, Color::Green),
+        (
+            "Already installed",
+            statistics.already_installed,
+            Color::Green,
+        ),
+        ("Pending", statistics.pending, Color::Yellow),
+        ("Downloading", statistics.downloading, Color::Cyan),
+        ("Installing", statistics.installing, Color::Cyan),
+        ("Rebooting", statistics.rebooting, Color::Cyan),
+        (
+            "Paused before install",
+            statistics.pause_before_installing,
+            Color::Yellow,
+        ),
+        (
+            "Paused before reboot",
+            statistics.pause_before_rebooting,
+            Color::Yellow,
+        ),
+        (
+            "Paused before commit",
+            statistics.pause_before_committing,
+            Color::Yellow,
+        ),
+        ("Failed", statistics.failure, Color::Red),
+        ("No artifact", statistics.noartifact, Color::Red),
+        ("Aborted", statistics.aborted, Color::Red),
+    ] {
+        states.add_row(vec![Cell::new(label), Cell::new(count).fg(color)]);
+    }
+
+    let completed = statistics.completed();
+    let total = deployment.device_count as u64;
+    let percent = if total == 0 {
+        0.0
+    } else {
+        (completed as f64 / total as f64 * 100.0).min(100.0)
+    };
+    format!(
+        "{}\n{details}\n\nProgress: {completed}/{total} ({percent:.0}%) · {} active\n{states}\n",
+        Style::new().bold().magenta().apply_to("Deployment status"),
+        statistics.active()
+    )
+}
+
 pub fn inventory_table(inventory: &Value, title: &str) -> Result<()> {
     let mut rows = Vec::new();
     flatten_inventory("", inventory, &mut rows);
@@ -169,6 +277,17 @@ fn header(labels: &[&str]) -> Vec<Cell> {
                 .add_attribute(Attribute::Bold)
         })
         .collect()
+}
+
+fn deployment_status_cell(status: &str) -> Cell {
+    let color = match status {
+        "finished" => Color::Green,
+        "inprogress" | "pending" => Color::Cyan,
+        "scheduled" => Color::Yellow,
+        "aborted" => Color::Red,
+        _ => Color::White,
+    };
+    Cell::new(status).fg(color).add_attribute(Attribute::Bold)
 }
 
 fn styled_table() -> Table {

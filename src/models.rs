@@ -2,6 +2,20 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Clone, Debug)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total: Option<usize>,
+}
+
+impl<T> Page<T> {
+    pub fn has_more(&self, page: usize, per_page: usize) -> bool {
+        self.total
+            .map(|total| page.saturating_mul(per_page) < total)
+            .unwrap_or_else(|| self.items.len() == per_page)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Device {
     pub id: String,
@@ -124,6 +138,80 @@ pub struct DeploymentRequest<'a> {
     pub devices: Vec<&'a str>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Deployment {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub artifact_name: String,
+    #[serde(default)]
+    pub created: String,
+    #[serde(default)]
+    pub finished: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub device_count: usize,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub statistics: Option<DeploymentStatistics>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl Deployment {
+    pub fn is_finished(&self) -> bool {
+        self.finished.is_some() || self.status.eq_ignore_ascii_case("finished")
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DeploymentStatistics {
+    #[serde(default)]
+    pub success: u64,
+    #[serde(default)]
+    pub pending: u64,
+    #[serde(default)]
+    pub failure: u64,
+    #[serde(default)]
+    pub downloading: u64,
+    #[serde(default)]
+    pub installing: u64,
+    #[serde(default)]
+    pub rebooting: u64,
+    #[serde(default)]
+    pub noartifact: u64,
+    #[serde(rename = "already-installed", alias = "already_installed", default)]
+    pub already_installed: u64,
+    #[serde(default)]
+    pub aborted: u64,
+    #[serde(default)]
+    pub pause_before_installing: u64,
+    #[serde(default)]
+    pub pause_before_rebooting: u64,
+    #[serde(default)]
+    pub pause_before_committing: u64,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl DeploymentStatistics {
+    pub fn completed(&self) -> u64 {
+        self.success + self.failure + self.noartifact + self.already_installed + self.aborted
+    }
+
+    pub fn active(&self) -> u64 {
+        self.downloading
+            + self.installing
+            + self.rebooting
+            + self.pause_before_installing
+            + self.pause_before_rebooting
+            + self.pause_before_committing
+    }
+}
+
 impl Artifact {
     /// Update type of the artifact (`rootfs-image`, `docker-compose`, custom
     /// module names, …). Best-effort: looks through every documented placement
@@ -195,5 +283,28 @@ mod tests {
         assert_eq!(in_info.kind(), "script");
         assert_eq!(in_updates.kind(), "rootfs-image");
         assert_eq!(missing.kind(), "unknown");
+    }
+
+    #[test]
+    fn paginated_results_use_total_when_the_server_provides_it() {
+        let page = Page {
+            items: vec![1, 2],
+            total: Some(5),
+        };
+        assert!(page.has_more(1, 2));
+        assert!(!page.has_more(3, 2));
+    }
+
+    #[test]
+    fn deployment_statistics_count_terminal_and_active_states() {
+        let statistics = DeploymentStatistics {
+            success: 2,
+            failure: 1,
+            downloading: 3,
+            already_installed: 4,
+            ..DeploymentStatistics::default()
+        };
+        assert_eq!(statistics.completed(), 7);
+        assert_eq!(statistics.active(), 3);
     }
 }

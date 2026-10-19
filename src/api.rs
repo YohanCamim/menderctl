@@ -12,7 +12,10 @@ use serde_json::{Value, json};
 use tokio::{fs, io::AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
-use crate::models::{Artifact, DeploymentRequest, Device, DownloadLink, InventoryDevice};
+use crate::models::{
+    Artifact, Deployment, DeploymentRequest, DeploymentStatistics, Device, DownloadLink,
+    InventoryDevice, Page,
+};
 
 const INVENTORY_SEARCH: &str = "/api/management/v2/inventory/filters/search";
 const INVENTORY_DEVICE: &str = "/api/management/v1/inventory/devices";
@@ -92,10 +95,15 @@ impl MenderApi {
         .await
     }
 
-    pub async fn search_devices(&self) -> Result<Vec<InventoryDevice>> {
+    pub async fn search_devices_page(
+        &self,
+        page: usize,
+        per_page: usize,
+    ) -> Result<Page<InventoryDevice>> {
+        validate_pagination(page, per_page)?;
         let body = json!({
-            "page": 1,
-            "per_page": 500,
+            "page": page,
+            "per_page": per_page,
             "filters": [{
                 "scope": "identity",
                 "attribute": "status",
@@ -117,7 +125,28 @@ impl MenderApi {
             .send()
             .await?;
         let response = ensure_status(response, &[StatusCode::OK]).await?;
+        let total = total_count(&response);
         let mut devices: Vec<InventoryDevice> = response.json().await?;
+        devices.sort_by_key(|device| device.display_name().to_lowercase());
+        Ok(Page {
+            items: devices,
+            total,
+        })
+    }
+
+    pub async fn search_devices(&self) -> Result<Vec<InventoryDevice>> {
+        const PER_PAGE: usize = 100;
+        let mut devices = Vec::new();
+        let mut page_number = 1;
+        loop {
+            let page = self.search_devices_page(page_number, PER_PAGE).await?;
+            let has_more = page.has_more(page_number, PER_PAGE);
+            devices.extend(page.items);
+            if !has_more {
+                break;
+            }
+            page_number += 1;
+        }
         devices.sort_by_key(|device| device.display_name().to_lowercase());
         Ok(devices)
     }
@@ -154,12 +183,48 @@ impl MenderApi {
     }
 
     pub async fn list_artifacts(&self, page: usize, per_page: usize) -> Result<Vec<Artifact>> {
+        Ok(self.list_artifacts_page(page, per_page).await?.items)
+    }
+
+    pub async fn list_all_artifacts(&self) -> Result<Vec<Artifact>> {
+        const PER_PAGE: usize = 100;
+        let mut artifacts = Vec::new();
+        let mut page_number = 1;
+        loop {
+            let page = self.list_artifacts_page(page_number, PER_PAGE).await?;
+            let has_more = page.has_more(page_number, PER_PAGE);
+            artifacts.extend(page.items);
+            if !has_more {
+                break;
+            }
+            page_number += 1;
+        }
+        Ok(artifacts)
+    }
+
+    pub async fn list_artifacts_page(
+        &self,
+        page: usize,
+        per_page: usize,
+    ) -> Result<Page<Artifact>> {
         validate_pagination(page, per_page)?;
-        self.get_json(
-            &format!("{ARTIFACT_LIST}?page={page}&per_page={per_page}"),
-            &[StatusCode::OK],
-        )
-        .await
+        let response = self
+            .authorized(
+                self.client
+                    .get(self.url(ARTIFACT_LIST))
+                    .query(&[("page", page), ("per_page", per_page)]),
+            )
+            .send()
+            .await?;
+        let response = ensure_status(response, &[StatusCode::OK]).await?;
+        let total = total_count(&response);
+        Ok(Page {
+            items: response
+                .json()
+                .await
+                .context("invalid JSON response from Mender")?,
+            total,
+        })
     }
 
     pub async fn list_artifacts_raw(&self, page: usize, per_page: usize) -> Result<Value> {
@@ -261,12 +326,30 @@ impl MenderApi {
         artifact_name: &str,
         deployment_name: Option<&str>,
     ) -> Result<()> {
+        self.deploy_many(&[device_id], artifact_name, deployment_name)
+            .await
+    }
+
+    pub async fn deploy_many(
+        &self,
+        device_ids: &[&str],
+        artifact_name: &str,
+        deployment_name: Option<&str>,
+    ) -> Result<()> {
+        if device_ids.is_empty() {
+            bail!("at least one device is required for a deployment");
+        }
         let request = DeploymentRequest {
             name: deployment_name
                 .map(ToOwned::to_owned)
-                .unwrap_or_else(|| format!("Deployment of {artifact_name} to {device_id}")),
+                .unwrap_or_else(|| match device_ids {
+                    [device_id] => format!("Deployment of {artifact_name} to {device_id}"),
+                    devices => {
+                        format!("Deployment of {artifact_name} to {} devices", devices.len())
+                    }
+                }),
             artifact_name,
-            devices: vec![device_id],
+            devices: device_ids.to_vec(),
         };
         let response = self
             .authorized(self.client.post(self.url(DEPLOYMENTS)))
@@ -274,6 +357,65 @@ impl MenderApi {
             .send()
             .await?;
         ensure_status(response, &[StatusCode::CREATED]).await?;
+        Ok(())
+    }
+
+    pub async fn list_deployments(
+        &self,
+        page: usize,
+        per_page: usize,
+        status: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<Page<Deployment>> {
+        validate_pagination(page, per_page)?;
+        let mut query = vec![
+            ("page", page.to_string()),
+            ("per_page", per_page.to_string()),
+        ];
+        if let Some(status) = status.filter(|value| !value.is_empty()) {
+            query.push(("status", status.to_owned()));
+        }
+        if let Some(search) = search.filter(|value| !value.is_empty()) {
+            query.push(("search", search.to_owned()));
+        }
+        let response = self
+            .authorized(self.client.get(self.url(DEPLOYMENTS)).query(&query))
+            .send()
+            .await?;
+        let response = ensure_status(response, &[StatusCode::OK]).await?;
+        let total = total_count(&response);
+        Ok(Page {
+            items: response
+                .json()
+                .await
+                .context("invalid JSON response from Mender")?,
+            total,
+        })
+    }
+
+    pub async fn deployment(&self, deployment_id: &str) -> Result<Deployment> {
+        self.get_json(&format!("{DEPLOYMENTS}/{deployment_id}"), &[StatusCode::OK])
+            .await
+    }
+
+    pub async fn deployment_statistics(&self, deployment_id: &str) -> Result<DeploymentStatistics> {
+        self.get_json(
+            &format!("{DEPLOYMENTS}/{deployment_id}/statistics"),
+            &[StatusCode::OK],
+        )
+        .await
+    }
+
+    pub async fn cancel_deployment(&self, deployment_id: &str) -> Result<()> {
+        let response = self
+            .authorized(
+                self.client
+                    .put(self.url(&format!("{DEPLOYMENTS}/{deployment_id}/status"))),
+            )
+            .json(&json!({ "status": "aborted" }))
+            .send()
+            .await?;
+        ensure_status(response, &[StatusCode::NO_CONTENT]).await?;
         Ok(())
     }
 
@@ -387,6 +529,14 @@ fn validate_pagination(page: usize, per_page: usize) -> Result<()> {
         bail!("page and per-page must be greater than zero");
     }
     Ok(())
+}
+
+fn total_count(response: &Response) -> Option<usize> {
+    response
+        .headers()
+        .get("X-Total-Count")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
 }
 
 async fn ensure_status(response: Response, expected: &[StatusCode]) -> Result<Response> {
@@ -513,11 +663,20 @@ mod tests {
     use super::MenderApi;
 
     async fn mock_server(status: &str, body: &str) -> (String, oneshot::Receiver<String>) {
+        mock_server_with_headers(status, body, "").await
+    }
+
+    async fn mock_server_with_headers(
+        status: &str,
+        body: &str,
+        headers: &str,
+    ) -> (String, oneshot::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (request_tx, request_rx) = oneshot::channel();
         let status = status.to_owned();
         let body = body.to_owned();
+        let headers = headers.to_owned();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buffer = vec![0_u8; 8192];
@@ -525,10 +684,32 @@ mod tests {
             let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
             let _ = request_tx.send(request);
             let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), request_rx)
+    }
+
+    async fn mock_server_sequence(bodies: Vec<String>) -> (String, oneshot::Receiver<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0_u8; 16_384];
+                let read = socket.read(&mut buffer).await.unwrap();
+                requests.push(String::from_utf8_lossy(&buffer[..read]).into_owned());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            let _ = request_tx.send(requests);
         });
         (format!("http://{address}"), request_rx)
     }
@@ -568,5 +749,79 @@ mod tests {
         let error = api.list_devices(1, 20).await.unwrap_err().to_string();
         assert!(error.contains("401 Unauthorized"));
         assert!(error.contains("menderctl login"));
+    }
+
+    #[tokio::test]
+    async fn searches_inventory_page_by_page_and_reads_the_total() {
+        let (server, request) = mock_server_with_headers(
+            "200 OK",
+            r#"[{"id":"device-2","attributes":[]}]"#,
+            "X-Total-Count: 5\r\n",
+        )
+        .await;
+        let api = MenderApi::new(server, "token", false).unwrap();
+        let page = api.search_devices_page(2, 2).await.unwrap();
+        assert_eq!(page.items[0].id, "device-2");
+        assert_eq!(page.total, Some(5));
+        assert!(page.has_more(2, 2));
+        let request = request.await.unwrap();
+        assert!(request.starts_with("POST /api/management/v2/inventory/filters/search"));
+        assert!(request.contains(r#""page":2"#));
+        assert!(request.contains(r#""per_page":2"#));
+    }
+
+    #[tokio::test]
+    async fn loads_every_inventory_page_for_complete_interactive_search() {
+        let first_page = serde_json::to_string(
+            &(0..100)
+                .map(|index| {
+                    serde_json::json!({
+                        "id": format!("device-{index:03}"),
+                        "attributes": []
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let second_page = r#"[{"id":"device-final","attributes":[]}]"#.to_owned();
+        let (server, requests) = mock_server_sequence(vec![first_page, second_page]).await;
+        let api = MenderApi::new(server, "token", false).unwrap();
+        let devices = api.search_devices().await.unwrap();
+        assert_eq!(devices.len(), 101);
+        assert!(devices.iter().any(|device| device.id == "device-final"));
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains(r#""page":1"#));
+        assert!(requests[1].contains(r#""page":2"#));
+    }
+
+    #[tokio::test]
+    async fn creates_one_deployment_for_multiple_devices() {
+        let (server, request) = mock_server("201 Created", "{}").await;
+        let api = MenderApi::new(server, "token", false).unwrap();
+        api.deploy_many(
+            &["device-1", "device-2"],
+            "release-2.4",
+            Some("fleet update"),
+        )
+        .await
+        .unwrap();
+        let request = request.await.unwrap();
+        assert!(request.starts_with("POST /api/management/v1/deployments/deployments"));
+        assert!(request.contains(r#""name":"fleet update""#));
+        assert!(request.contains(r#""devices":["device-1","device-2"]"#));
+    }
+
+    #[tokio::test]
+    async fn cancels_a_deployment_with_the_aborted_status() {
+        let (server, request) = mock_server("204 No Content", "").await;
+        let api = MenderApi::new(server, "token", false).unwrap();
+        api.cancel_deployment("deployment-1").await.unwrap();
+        let request = request.await.unwrap();
+        assert!(
+            request
+                .starts_with("PUT /api/management/v1/deployments/deployments/deployment-1/status")
+        );
+        assert!(request.contains(r#""status":"aborted""#));
     }
 }

@@ -56,6 +56,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ArtifactsCommand,
     },
+    /// Inspect, follow, and cancel deployments.
+    Deployments {
+        #[command(subcommand)]
+        command: DeploymentsCommand,
+    },
     /// Open a native remote terminal.
     Terminal { device_id: String },
     /// Forward local TCP or UDP ports to a device.
@@ -139,15 +144,73 @@ pub enum ArtifactsCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Create a deployment for a device.
+    /// Create a deployment for one or more devices.
     Deploy {
         artifact_name: String,
-        device_id: String,
+        #[arg(required = true)]
+        device_ids: Vec<String>,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct DeploymentListArgs {
+    #[command(flatten)]
+    pub list: ListArgs,
+    /// Only show deployments with this aggregate status.
+    #[arg(long, value_enum)]
+    pub status: Option<DeploymentStatus>,
+    /// Search deployment names and descriptions.
+    #[arg(long)]
+    pub search: Option<String>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum DeploymentsCommand {
+    /// List deployments.
+    List(DeploymentListArgs),
+    /// Show deployment details and device statistics.
+    Show {
+        deployment_id: String,
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Refresh deployment progress until it finishes or Ctrl+C is pressed.
+    Watch {
+        deployment_id: String,
+        /// Refresh interval in seconds.
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+    },
+    /// Cancel a deployment that has not finished yet.
+    Cancel {
+        deployment_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum DeploymentStatus {
+    Scheduled,
+    Pending,
+    #[value(name = "inprogress")]
+    InProgress,
+    Finished,
+}
+
+impl DeploymentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::Pending => "pending",
+            Self::InProgress => "inprogress",
+            Self::Finished => "finished",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Args)]
@@ -167,4 +230,55 @@ pub enum CompletionShell {
     Fish,
     PowerShell,
     Elvish,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_creation_accepts_multiple_device_ids() {
+        let cli = Cli::try_parse_from([
+            "menderctl",
+            "artifacts",
+            "deploy",
+            "release-2.4",
+            "device-1",
+            "device-2",
+            "--yes",
+        ])
+        .unwrap();
+        let Some(Command::Artifacts {
+            command:
+                ArtifactsCommand::Deploy {
+                    artifact_name,
+                    device_ids,
+                    yes,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(artifact_name, "release-2.4");
+        assert_eq!(device_ids, ["device-1", "device-2"]);
+        assert!(yes);
+    }
+
+    #[test]
+    fn deployment_list_accepts_the_api_inprogress_spelling() {
+        let cli =
+            Cli::try_parse_from(["menderctl", "deployments", "list", "--status", "inprogress"])
+                .unwrap();
+        let Some(Command::Deployments {
+            command: DeploymentsCommand::List(args),
+        }) = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(
+            args.status.map(DeploymentStatus::as_str),
+            Some("inprogress")
+        );
+    }
 }
