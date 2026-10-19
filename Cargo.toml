@@ -1,0 +1,41 @@
+[package]
+name = "menderctl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "A native, user-friendly Rust CLI for the Mender management APIs"
+repository = "https://github.com/YohanCamim/menderctl"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
+comfy-table = "7.1"
+console = "0.16"
+crossterm = "0.29"
+dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+dirs = "6.0"
+futures-util = "0.3"
+indicatif = "0.18"
+native-tls = "0.2"
+reqwest = { version = "0.12", features = ["json", "multipart", "stream", "native-tls"] }
+rmp-serde = "1.3"
+rmpv = { version = "1.3", features = ["with-serde"] }
+rpassword = "7.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1.0"
+tar = "0.4"
+tokio = { version = "1.47", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+uuid = { version = "1.18", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+

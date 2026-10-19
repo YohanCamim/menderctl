@@ -1,0 +1,32 @@
+image: rust:1.90-bookworm
+
+stages:
+  - test
+  - build
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+
+cache:
+  key: cargo
+  paths:
+    - .cargo/registry
+    - .cargo/git
+    - target
+
+check:
+  stage: test
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt --all -- --check
+    - cargo clippy --all-targets -- -D warnings
+    - cargo test --all-targets --locked
+
+build:linux:
+  stage: build
+  script:
+    - cargo build --release --locked
+    - cp target/release/menderctl menderctl.linux.amd64
+  artifacts:
+    paths:
+      - menderctl.linux.amd64

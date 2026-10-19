@@ -1,0 +1,5 @@
+menderctl
+menderctl.linux.amd64
+menderctl.darwin.arm64
+/target
+autocomplete/autocomplete*
