@@ -1,33 +1,82 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use dialoguer::{Confirm, FuzzySelect, Input, theme::ColorfulTheme};
+use anyhow::Result;
+use dialoguer::{Confirm, FuzzySelect, Input, Select, theme::ColorfulTheme};
 
-use crate::{api::MenderApi, models::InventoryDevice, portforward, terminal, ui};
+use crate::{
+    api::MenderApi,
+    favorite::{FavoriteDevice, Favorites},
+    models::{InventoryDevice, SortKey, sort_artifacts},
+    picker, portforward, terminal, ui,
+};
 
 pub async fn run(api: &MenderApi, server: &str, token: &str, skip_verify: bool) -> Result<()> {
     ui::welcome();
     let theme = ColorfulTheme::default();
+    let mut favorites = Favorites::load()?;
+    let mut initial_selection = 0;
     loop {
         let devices = api.search_devices().await?;
         if devices.is_empty() {
             ui::warning("No accepted devices were found.");
             return Ok(());
         }
-        ui::devices_table(&devices);
-        let labels = devices
-            .iter()
-            .map(|device| format!("{}  ·  {}", device.display_name(), device.id))
-            .chain(std::iter::once("Quit".to_owned()))
-            .collect::<Vec<_>>();
-        let choice = FuzzySelect::with_theme(&theme)
-            .with_prompt("Search for and select a device")
-            .items(&labels)
-            .default(0)
-            .interact()?;
-        if choice == devices.len() {
+        let choice = loop {
+            let favorite_id = favorites
+                .for_server(server)
+                .map(|favorite| favorite.id.as_str());
+            let favorite_index =
+                favorite_id.and_then(|id| devices.iter().position(|device| device.id == id));
+            let rows = devices
+                .iter()
+                .map(|device| {
+                    vec![
+                        device.display_name(),
+                        device.id.clone(),
+                        device.updated_at().unwrap_or("unknown").to_owned(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let pick = tokio::task::spawn_blocking(move || {
+                picker::pick_device(
+                    "Select a device",
+                    &["Name", "Device ID", "Last contact"],
+                    rows,
+                    favorite_index,
+                    initial_selection,
+                )
+            })
+            .await??;
+            match pick {
+                picker::DevicePick::Selected(index) => break Some(index),
+                picker::DevicePick::Cancelled => break None,
+                picker::DevicePick::ToggleFavorite(index) => {
+                    initial_selection = index;
+                    let device = &devices[index];
+                    let name = device.display_name();
+                    let is_favorite = favorites
+                        .toggle(
+                            server,
+                            FavoriteDevice {
+                                id: device.id.clone(),
+                                name: name.clone(),
+                            },
+                        )?
+                        .is_some();
+                    if is_favorite {
+                        ui::success(format!(
+                            "{name} is now the favorite device; use `menderctl --favorite` to connect."
+                        ));
+                    } else {
+                        ui::warning(format!("{name} is no longer the favorite device."));
+                    }
+                }
+            }
+        };
+        let Some(choice) = choice else {
             break;
-        }
+        };
+        initial_selection = choice;
         let device = &devices[choice];
         if !device_menu(api, server, token, skip_verify, device, &theme).await? {
             break;
@@ -56,13 +105,17 @@ async fn device_menu(
         "Quit",
     ];
     loop {
-        let action = FuzzySelect::with_theme(theme)
-            .with_prompt(format!("Action for {}", device.display_name()))
+        ui::device_banner(&device.display_name(), &device.id, "Device session");
+        let Some(action) = FuzzySelect::with_theme(theme)
+            .with_prompt("Select an action")
             .items(actions)
             .default(0)
-            .interact()?;
-        match action {
-            0 => terminal::run(api, server, token, skip_verify, &device.id).await?,
+            .interact_opt()?
+        else {
+            return Ok(true);
+        };
+        let outcome = match action {
+            0 => terminal::run(api, server, token, skip_verify, &device.id).await,
             1 => {
                 let mapping: String = Input::with_theme(theme)
                     .with_prompt("Local port[:remote host:remote port]")
@@ -77,20 +130,22 @@ async fn device_menu(
                     "127.0.0.1",
                     &[mapping],
                 )
-                .await?;
+                .await
             }
-            2 => upload_file(api, device, theme).await?,
-            3 => download_file(api, device, theme).await?,
-            4 => deploy_artifact(api, device, theme).await?,
-            5 => {
-                let inventory = api.inventory(&device.id).await?;
+            2 => upload_file(api, device, theme).await,
+            3 => download_file(api, device, theme).await,
+            4 => deploy_artifact(api, device, theme).await,
+            5 => api.inventory(&device.id).await.and_then(|inventory| {
                 ui::inventory_table(
                     &inventory,
                     &format!("Inventory for {} ({})", device.display_name(), device.id),
-                );
-            }
+                )
+            }),
             6 => return Ok(true),
             _ => return Ok(false),
+        };
+        if let Err(error) = outcome {
+            ui::error(format!("{error:#}"));
         }
     }
 }
@@ -166,19 +221,40 @@ async fn deploy_artifact(
         ui::warning("No artifacts are available.");
         return Ok(());
     }
-    ui::artifacts_table(&artifacts);
-    let labels = artifacts
-        .iter()
-        .map(|artifact| format!("{}  ·  {}", artifact.name, artifact.description))
-        .collect::<Vec<_>>();
-    let choice = FuzzySelect::with_theme(theme)
-        .with_prompt("Artifact to deploy")
-        .items(&labels)
+    let ordering = Select::with_theme(theme)
+        .with_prompt(format!("Order artifacts for {}", device.display_name()))
+        .items(["Name", "Type"])
         .default(0)
         .interact()?;
-    let artifact = artifacts
-        .get(choice)
-        .context("invalid artifact selection")?;
+    let mut artifacts = artifacts;
+    sort_artifacts(
+        &mut artifacts,
+        if ordering == 0 {
+            SortKey::Name
+        } else {
+            SortKey::Type
+        },
+    );
+    let rows = artifacts
+        .iter()
+        .map(|artifact| {
+            let kind = artifact.kind();
+            let kind = if kind == "unknown" {
+                "—".to_owned()
+            } else {
+                kind
+            };
+            vec![artifact.name.clone(), kind, artifact.description.clone()]
+        })
+        .collect::<Vec<_>>();
+    let Some(choice) = tokio::task::spawn_blocking(move || {
+        picker::pick("Select an artifact", &["Name", "Type", "Description"], rows)
+    })
+    .await??
+    else {
+        return Ok(());
+    };
+    let artifact = &artifacts[choice];
     if Confirm::with_theme(theme)
         .with_prompt(format!(
             "Deploy {} to {}?",

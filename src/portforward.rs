@@ -17,6 +17,7 @@ use crate::{
         Accept, Open, PROTO_CONTROL, PROTO_PORT_FORWARD, PROTO_PORT_FORWARD_V2, PortForwardOpen,
         ProtoMessage, ProtocolError, connect_device, send_proto,
     },
+    ui,
 };
 
 const CONNECTION_ID: &str = "connection_id";
@@ -65,6 +66,12 @@ pub async fn run(
     if !api.device_connected(device_id).await? {
         bail!("device {device_id} is not connected");
     }
+    let device_name = api.display_name(device_id).await;
+    ui::device_banner(
+        &device_name,
+        device_id,
+        "Port forwarding — press CTRL+C to stop",
+    );
     let mappings = mapping_values
         .iter()
         .map(|value| PortMapping::parse(value))

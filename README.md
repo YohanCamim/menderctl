@@ -7,10 +7,13 @@ requiring a Python runtime.
 
 ## Features
 
-- Interactive device selection with fuzzy search
+- Full-screen, scrollable table picker with type-to-filter for devices and artifacts
+- Favorite device shortcut for one-keystroke remote access
 - Authentication and local token storage
-- Device listing and inventory inspection
+- Device listing and searchable, scrollable inventory inspection
+- Copy inventory values directly to the terminal clipboard
 - Artifact listing, upload, download, deletion, and deployment
+- Artifact sorting by name or update type (`--sort type`)
 - Remote file upload and download
 - Native remote terminal support
 - TCP and UDP port forwarding through Mender protocols v1 and v2
@@ -107,6 +110,10 @@ Configuration files use JSON:
 Effective precedence is: command-line arguments, `MENDER_SERVER` and
 `MENDER_TOKEN`, configuration file, then defaults.
 
+The favorite device for each Mender server is stored separately in
+`$XDG_CONFIG_HOME/menderctl/favorites.json` (or
+`$HOME/.config/menderctl/favorites.json`).
+
 Use `--skip-verify` only with trusted development servers using a certificate
 that cannot be verified normally.
 
@@ -118,6 +125,35 @@ Start the interactive interface:
 menderctl --server https://hosted.mender.io
 ```
 
+In the device picker, press `Shift+F` on a device to mark or unmark it as the
+favorite. The `★` marker identifies the current favorite. Connect to it
+directly from any terminal with:
+
+```bash
+menderctl --favorite
+```
+
+The device and artifact tables use the available terminal height instead of
+printing every result. Navigate with `↑`/`↓`, move one page with
+`Page Up`/`Page Down`, and jump to either end with `Home`/`End`.
+
+Device inventory opens in the same full-screen table browser. Select an
+attribute and press `Shift+C` to copy its complete value to the terminal
+clipboard. Lowercase `f` and `c` remain normal search characters.
+
+### Interactive controls
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move by one row |
+| `Page Up` / `Page Down` | Move by one visible page |
+| `Home` / `End` | Jump to the first or last result |
+| Type text | Filter the visible results |
+| `Enter` | Select the highlighted device or artifact |
+| `Shift+F` | Mark or unmark the highlighted device as favorite |
+| `Shift+C` | Copy the highlighted inventory value |
+| `Esc` | Close the current table, or return from the action menu to the device list |
+
 Use commands directly in scripts:
 
 ```bash
@@ -128,12 +164,14 @@ menderctl devices inventory DEVICE_ID
 
 # Artifacts and deployments
 menderctl artifacts list
+menderctl artifacts list --sort type
 menderctl artifacts upload update.mender --description "Release 2.4"
 menderctl artifacts download ARTIFACT_ID --destination-path .
 menderctl artifacts deploy release-2.4 DEVICE_ID --yes
 menderctl artifacts delete ARTIFACT_ID --yes
 
 # Remote access
+menderctl --favorite
 menderctl terminal DEVICE_ID
 menderctl port-forward DEVICE_ID 8080:80
 menderctl port-forward DEVICE_ID 2222:192.168.1.10:22

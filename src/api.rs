@@ -140,6 +140,19 @@ impl MenderApi {
             .is_some_and(|status| status.eq_ignore_ascii_case("connected")))
     }
 
+    /// Best-effort friendly name for a device; falls back to the raw id.
+    pub async fn display_name(&self, device_id: &str) -> String {
+        let device: std::result::Result<InventoryDevice, _> = self
+            .get_json(
+                &format!("{INVENTORY_DEVICE}/{device_id}"),
+                &[StatusCode::OK],
+            )
+            .await;
+        device
+            .map(|device| device.display_name())
+            .unwrap_or_else(|_| device_id.to_owned())
+    }
+
     pub async fn list_artifacts(&self, page: usize, per_page: usize) -> Result<Vec<Artifact>> {
         validate_pagination(page, per_page)?;
         self.get_json(

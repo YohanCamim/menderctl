@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::{
     api::MenderApi,
     protocol::{PROTO_SHELL, ProtoMessage, connect_device, send_proto},
+    ui,
 };
 
 const DEFAULT_WIDTH: u16 = 80;
@@ -28,7 +29,13 @@ pub async fn run(
     if !api.device_connected(device_id).await? {
         bail!("device {device_id} is not connected");
     }
-    eprintln!("Connecting to device {device_id}…");
+    let device_name = api.display_name(device_id).await;
+    ui::device_banner(
+        &device_name,
+        device_id,
+        "Remote terminal — press CTRL+] to leave",
+    );
+    eprintln!("Connecting…");
     let socket = connect_device(server, device_id, token, skip_verify)
         .await
         .context("failed to open the terminal WebSocket")?;
@@ -68,7 +75,6 @@ pub async fn run(
         }
     };
 
-    eprintln!("Press CTRL+] to leave the session");
     let _raw = RawMode::enable()?;
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();

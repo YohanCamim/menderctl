@@ -1,3 +1,4 @@
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -121,4 +122,78 @@ pub struct DeploymentRequest<'a> {
     pub name: String,
     pub artifact_name: &'a str,
     pub devices: Vec<&'a str>,
+}
+
+impl Artifact {
+    /// Update type of the artifact (`rootfs-image`, `docker-compose`, custom
+    /// module names, …). Best-effort: looks through every documented placement
+    /// in the Mender JSON and falls back to `unknown`.
+    pub fn kind(&self) -> String {
+        self.extra
+            .get("type_info")
+            .and_then(|info| info.get("type"))
+            .or_else(|| {
+                self.extra
+                    .get("info")
+                    .and_then(|info| info.get("type_info"))
+                    .and_then(|info| info.get("type"))
+            })
+            .or_else(|| {
+                self.extra
+                    .get("updates")
+                    .and_then(Value::as_array)
+                    .and_then(|updates| updates.first())
+                    .and_then(|update| update.get("type_info"))
+                    .and_then(|info| info.get("type"))
+            })
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown")
+            .to_owned()
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum SortKey {
+    Name,
+    Type,
+}
+
+pub fn sort_artifacts(artifacts: &mut [Artifact], sort: SortKey) {
+    match sort {
+        SortKey::Name => artifacts.sort_by_key(|a| a.name.to_lowercase()),
+        SortKey::Type => artifacts.sort_by(|a, b| {
+            a.kind()
+                .to_lowercase()
+                .cmp(&b.kind().to_lowercase())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_the_update_type_from_every_documented_placement() {
+        let top_level: Artifact = serde_json::from_value(json!({
+            "id": "a", "type_info": {"type": "docker-compose"}
+        }))
+        .unwrap();
+        let in_info: Artifact = serde_json::from_value(json!({
+            "id": "b", "info": {"type_info": {"type": "script"}}
+        }))
+        .unwrap();
+        let in_updates: Artifact = serde_json::from_value(json!({
+            "id": "c", "updates": [{"type_info": {"type": "rootfs-image"}}]
+        }))
+        .unwrap();
+        let missing: Artifact = serde_json::from_value(json!({"id": "d"})).unwrap();
+        assert_eq!(top_level.kind(), "docker-compose");
+        assert_eq!(in_info.kind(), "script");
+        assert_eq!(in_updates.kind(), "rootfs-image");
+        assert_eq!(missing.kind(), "unknown");
+    }
 }

@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use dialoguer::{Confirm, Input, theme::ColorfulTheme};
@@ -13,7 +13,10 @@ use menderctl::{
     api::MenderApi,
     cli::{ArtifactsCommand, Cli, Command, CompletionShell, DevicesCommand, LoginArgs},
     config::{RuntimeConfig, save_token},
-    interactive, portforward, terminal, ui,
+    favorite::Favorites,
+    interactive,
+    models::sort_artifacts,
+    portforward, terminal, ui,
 };
 
 #[tokio::main]
@@ -27,12 +30,36 @@ async fn main() {
 async fn try_main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
-    if cli.command.is_none() && !io::stdin().is_terminal() {
+    if cli.favorite && cli.command.is_some() {
+        bail!("--favorite cannot be combined with a subcommand");
+    }
+    if !cli.favorite && cli.command.is_none() && !io::stdin().is_terminal() {
         Cli::command().print_help()?;
         println!();
         return Ok(());
     }
     let config = RuntimeConfig::resolve(&cli)?;
+    if cli.favorite {
+        let favorite = Favorites::load()?
+            .for_server(&config.server)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "no favorite device is configured for {}; open the interactive interface and press Shift+F on a device",
+                    config.server
+                )
+            })?;
+        let token = config.require_token()?.to_owned();
+        let api = MenderApi::new(&config.server, &token, config.skip_verify)?;
+        return terminal::run(
+            &api,
+            &config.server,
+            &token,
+            config.skip_verify,
+            &favorite.id,
+        )
+        .await;
+    }
     match cli.command.clone().unwrap_or(Command::Interactive) {
         Command::Completion { shell } => completion(shell),
         Command::Login(args) => login(&config, args).await,
@@ -73,7 +100,7 @@ async fn dispatch_authenticated(
                 if raw {
                     println!("{}", serde_json::to_string_pretty(&inventory)?);
                 } else {
-                    ui::inventory_table(&inventory, &format!("Inventory for {device_id}"));
+                    ui::inventory_table(&inventory, &format!("Inventory for {device_id}"))?;
                 }
                 Ok(())
             }
@@ -134,15 +161,20 @@ async fn login(config: &RuntimeConfig, args: LoginArgs) -> Result<()> {
 async fn artifacts(api: &MenderApi, command: ArtifactsCommand) -> Result<()> {
     match command {
         ArtifactsCommand::List(args) => {
-            if args.raw {
+            if args.list.raw {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &api.list_artifacts_raw(args.page, args.per_page).await?
+                        &api.list_artifacts_raw(args.list.page, args.list.per_page)
+                            .await?
                     )?
                 );
             } else {
-                ui::artifacts_table(&api.list_artifacts(args.page, args.per_page).await?);
+                let mut artifacts = api
+                    .list_artifacts(args.list.page, args.list.per_page)
+                    .await?;
+                sort_artifacts(&mut artifacts, args.sort);
+                ui::artifacts_table(&artifacts);
             }
         }
         ArtifactsCommand::Upload {
@@ -176,7 +208,12 @@ async fn artifacts(api: &MenderApi, command: ArtifactsCommand) -> Result<()> {
             name,
             yes,
         } => {
-            if yes || confirm(&format!("Deploy {artifact_name} to {device_id}?"))? {
+            let device_name = api.display_name(&device_id).await;
+            if yes
+                || confirm(&format!(
+                    "Deploy {artifact_name} to {device_name} ({device_id})?"
+                ))?
+            {
                 api.deploy(&device_id, &artifact_name, name.as_deref())
                     .await?;
                 ui::success("Deployment created.");
@@ -189,14 +226,24 @@ async fn artifacts(api: &MenderApi, command: ArtifactsCommand) -> Result<()> {
 async fn copy(api: &MenderApi, source: &str, destination: &str, yes: bool) -> Result<()> {
     match (parse_remote(source), parse_remote(destination)) {
         (None, Some((device_id, remote))) => {
-            if yes || confirm(&format!("Upload {source} to {device_id}:{remote}?"))? {
+            let device_name = api.display_name(device_id).await;
+            if yes
+                || confirm(&format!(
+                    "Upload {source} to {device_name} ({device_id}):{remote}?"
+                ))?
+            {
                 api.upload_file(device_id, PathBuf::from(source).as_path(), remote)
                     .await?;
                 ui::success("File uploaded.");
             }
         }
         (Some((device_id, remote)), None) => {
-            if yes || confirm(&format!("Download {device_id}:{remote} to {destination}?"))? {
+            let device_name = api.display_name(device_id).await;
+            if yes
+                || confirm(&format!(
+                    "Download {device_name} ({device_id}):{remote} to {destination}?"
+                ))?
+            {
                 let path = api
                     .download_file(device_id, remote, PathBuf::from(destination).as_path())
                     .await?;

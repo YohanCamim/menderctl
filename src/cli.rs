@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::models::SortKey;
+
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "menderctl",
@@ -29,6 +31,10 @@ pub struct Cli {
     /// Enable diagnostic logging.
     #[arg(short, long, global = true)]
     pub verbose: bool,
+
+    /// Open a remote terminal on the favorite device.
+    #[arg(long)]
+    pub favorite: bool,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -98,10 +104,19 @@ pub struct ListArgs {
     pub raw: bool,
 }
 
+#[derive(Clone, Debug, Args)]
+pub struct ArtifactListArgs {
+    #[command(flatten)]
+    pub list: ListArgs,
+    /// Sort the artifact list.
+    #[arg(long, value_enum, default_value_t = SortKey::Name)]
+    pub sort: SortKey,
+}
+
 #[derive(Clone, Debug, Subcommand)]
 pub enum ArtifactsCommand {
     /// List available artifacts.
-    List(ListArgs),
+    List(ArtifactListArgs),
     /// Upload an artifact to the server.
     Upload {
         artifact: PathBuf,

@@ -1,8 +1,10 @@
 pub mod api;
 pub mod cli;
 pub mod config;
+pub mod favorite;
 pub mod interactive;
 pub mod models;
+pub mod picker;
 pub mod portforward;
 pub mod protocol;
 pub mod terminal;
